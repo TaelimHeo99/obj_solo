@@ -1,0 +1,28 @@
+nc: 80  # number of classes
+depth_multiple: 1.0
+width_multiple: 1.0
+
+anchors:
+  - [10,14, 23,27, 37,58]            # P4/16
+  - [81,82, 135,169, 344,319]        # P5/32
+
+backbone:
+  # [from, number, module, args]    # args: [in_channels, out_channels, kernel_size, stride]
+  [[-1, 1, Conv_2,         [3,   32, 3, 2]],     # 0
+   [-1, 1, ConcatBlock_ms, [32,  64, 3, 2]],     # 1  (EMS_Block_2 → ConcatBlock_ms)
+   [-1, 1, BasicBlock_ms,  [64,  64, 3, 1]],     # 2  (BasicBlock_2 → BasicBlock_ms)
+   [-1, 1, ConcatBlock_ms, [64,  128, 3, 2]],    # 3
+   [-1, 1, BasicBlock_ms,  [128, 128, 3, 1]],    # 4
+   [-1, 1, ConcatBlock_ms, [128, 256, 3, 2]],    # 5
+   [-1, 1, BasicBlock_ms,  [256, 256, 3, 1]],    # 6
+   [-1, 1, ConcatBlock_ms, [256, 512, 3, 2]],    # 7
+   [-1, 1, BasicBlock_ms,  [512, 512, 3, 1]]]    # 8
+
+head:
+  [[-1, 1, BasicBlock_ms,  [512, 256, 3, 1]],     # 9
+   [-1, 1, ConcatBlock_ms, [256, 512, 3, 1]],     # 10  (원래 EMS 역할)
+   [9,  1, BasicBlock_ms,  [256, 128, 1, 1]],     # 11  (원래 256→128 유지)
+   [-1, 1, Sample,         [1, 2]],               # 12  (Upsample → Sample; [dummy, scale])
+   [[-1, 6], 1, Concat,    [1]],                  # 13  (Concat_s → Concat; dim=1)  (128 + 256 = 384)
+   [-1, 1, BasicBlock_ms,  [384, 256, 3, 1]],     # 14
+   [[14, 10], 1, Detect,   [80, anchors]]]        # 15 (Detect 입력 인덱스 동일)

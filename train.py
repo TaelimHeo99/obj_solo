@@ -52,6 +52,7 @@ from models.yolo import Detect  # for type hints if needed
 
 # ---- SNN imports (safe to import even when using YAML models) ----
 from models.stbp_model import STBP_YOLOTiny
+from models.solo_model import SOLO_YOLOTiny
 from models.snn_block import set_global_snn
 
 from utils.autoanchor import check_anchors
@@ -184,6 +185,9 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
         if opt.cfg == "stbp_py":
             anchors = ((10, 14, 23, 27, 37, 58), (81, 82, 135, 169, 344, 319))
             model = STBP_YOLOTiny(nc=nc, anchors=anchors, num_steps=opt.num_steps).to(device)
+        elif opt.cfg == "solo_py":
+            anchors = ((10, 14, 23, 27, 37, 58), (81, 82, 135, 169, 344, 319))
+            model = SOLO_YOLOTiny(nc=nc, anchors=anchors, num_steps=opt.num_steps).to(device)
         else:
             model = Model(cfg or ckpt["model"].yaml, ch=3, nc=nc, anchors=hyp.get("anchors")).to(device)
 
@@ -196,6 +200,9 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
         if opt.cfg == "stbp_py":
             anchors = ((10, 14, 23, 27, 37, 58), (81, 82, 135, 169, 344, 319))
             model = STBP_YOLOTiny(nc=nc, anchors=anchors, num_steps=opt.num_steps).to(device)
+        elif opt.cfg == "solo_py":
+            anchors = ((10, 14, 23, 27, 37, 58), (81, 82, 135, 169, 344, 319))
+            model = SOLO_YOLOTiny(nc=nc, anchors=anchors, num_steps=opt.num_steps).to(device)
         else:
             model = Model(cfg, ch=3, nc=nc, anchors=hyp.get("anchors")).to(device)
 
@@ -332,7 +339,9 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
     maps = np.zeros(nc)
     results = (0, 0, 0, 0, 0, 0, 0)
     scheduler.last_epoch = start_epoch - 1
-    scaler = torch.cuda.amp.GradScaler(enabled=amp)
+    device_type = 'cuda' if device.type == 'cuda' else 'cpu'
+    # GradScaler: 손실 스케일링/step/update 담당
+    scaler = torch.amp.GradScaler(device_type, enabled=amp)
     stopper, stop = EarlyStopping(patience=opt.patience), False
     compute_loss = ComputeLoss(model)
     callbacks.run("on_train_start")
@@ -403,7 +412,7 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                     ns = [math.ceil(x * sf / gs) * gs for x in imgs.shape[2:]]
                     imgs = nn.functional.interpolate(imgs, size=ns, mode="bilinear", align_corners=False)
 
-            with torch.cuda.amp.autocast(amp):
+            with torch.amp.autocast(device_type, enabled=amp):
                 # reset SNN states per batch (no-op for YAML models)
                 if hasattr(model, "reset_states"):
                     model.reset_states()
@@ -546,7 +555,7 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
 def parse_opt(known=False):
     parser = argparse.ArgumentParser()
     parser.add_argument("--weights", type=str, default=ROOT / "yolov3-tiny.pt", help="initial weights path")
-    parser.add_argument("--cfg", type=str, default="", help="model.yaml path or 'stbp_py' for SNN python model")
+    parser.add_argument("--cfg", type=str, default="", help="model.yaml path or 'stbp_py'/'solo_py' for SNN python model")
     parser.add_argument("--data", type=str, default=ROOT / "data/coco128.yaml", help="dataset.yaml path")
     parser.add_argument("--hyp", type=str, default=ROOT / "data/hyps/hyp.scratch-low.yaml", help="hyperparameters path")
     parser.add_argument("--epochs", type=int, default=100, help="total training epochs")
@@ -621,7 +630,7 @@ def main(opt, callbacks=Callbacks()):
     else:
         opt.data, opt.cfg, opt.hyp, opt.weights, opt.project = (
             check_file(opt.data),
-            (opt.cfg if opt.cfg == "stbp_py" else check_yaml(opt.cfg)),  # allow 'stbp_py' literal
+            (opt.cfg if opt.cfg in {"stbp_py", "solo_py"} else check_yaml(opt.cfg)),  # allow 'stbp_py' & 'solo_py' literals
             check_yaml(opt.hyp),
             str(opt.weights),
             str(opt.project),
@@ -631,7 +640,7 @@ def main(opt, callbacks=Callbacks()):
             if opt.project == str(ROOT / "runs/train"):
                 opt.project = str(ROOT / "runs/evolve")
             opt.exist_ok, opt.resume = opt.resume, False
-        if opt.name == "cfg" and opt.cfg != "stbp_py":
+        if opt.name == "cfg" and opt.cfg not in {"stbp_py", "solo_py"}:
             opt.name = Path(opt.cfg).stem
         opt.save_dir = str(increment_path(Path(opt.project) / opt.name, exist_ok=opt.exist_ok))
 

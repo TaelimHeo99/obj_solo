@@ -832,9 +832,9 @@ class AutoShape(nn.Module):
             if isinstance(size, int):  # expand
                 size = (size, size)
             p = next(self.model.parameters()) if self.pt else torch.empty(1, device=self.model.device)  # param
-            autocast = self.amp and (p.device.type != "cpu")  # Automatic Mixed Precision (AMP) inference
+            use_amp = self.amp and (p.device.type != "cpu")  # AMP on if CUDA
             if isinstance(ims, torch.Tensor):  # torch
-                with amp.autocast(autocast):
+                with torch.amp.autocast(p.device.type, enabled=use_amp):
                     return self.model(ims.to(p.device).type_as(p), augment=augment)  # inference
 
             # Pre-process
@@ -861,7 +861,7 @@ class AutoShape(nn.Module):
             x = np.ascontiguousarray(np.array(x).transpose((0, 3, 1, 2)))  # stack and BHWC to BCHW
             x = torch.from_numpy(x).to(p.device).type_as(p) / 255  # uint8 to fp16/32
 
-        with amp.autocast(autocast):
+        with torch.amp.autocast(p.device.type, enabled=use_amp):
             # Inference
             with dt[1]:
                 y = self.model(x, augment=augment)  # forward

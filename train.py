@@ -1,9 +1,9 @@
 # Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
 """
-Train a YOLOv3 model or the custom SNN (STBP_YOLOTiny) on a dataset.
+Train a YOLOv3 model or the custom SNN (STBP_YOLOTiny / SOLO_YOLOTiny) on a dataset.
 
 - Use YAML models as usual: --cfg models/yolov3-tiny.yaml
-- Use our SNN python model: --cfg stbp_py
+- Use our SNN python models: --cfg stbp_py or --cfg solo_py
 
 SNN extras:
   --num-steps, --snn-thresh, --snn-subthresh, --snn-tau, --snn-mem-init, --snn-spiking
@@ -102,6 +102,43 @@ from utils.torch_utils import (
     torch_distributed_zero_first,
 )
 
+
+def freeze_all_but_detect_ann(model: nn.Module):
+    """
+    Freeze all modules except Detect head(s) for ANN (YAML) models.
+
+    Used when --freeze 999 is passed:
+        - All parameters are frozen
+        - Only modules of type models.yolo.Detect are left trainable.
+    """
+    from models.yolo import Detect  # local import to avoid circular issues
+
+    for module in model.modules():
+        if isinstance(module, Detect):
+            for p in module.parameters():
+                p.requires_grad = True
+        else:
+            for p in module.parameters():
+                p.requires_grad = False
+
+
+def log_model_summary(model: nn.Module):
+    """
+    Print a compact summary of layers and parameter counts.
+
+    - #layers: number of nn.Module objects (including container modules)
+    - #params: total parameters
+    - #trainable: parameters with requires_grad=True
+    """
+    n_layers = len(list(model.modules()))
+    n_params = sum(p.numel() for p in model.parameters())
+    n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    LOGGER.info(
+        colorstr("Model Summary: ")
+        + f"{n_layers} layers, {n_params:,} total params, {n_trainable:,} trainable params"
+    )
+
+
 LOCAL_RANK = int(os.getenv("LOCAL_RANK", -1))
 RANK = int(os.getenv("RANK", -1))
 WORLD_SIZE = int(os.getenv("WORLD_SIZE", 1))
@@ -137,6 +174,20 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
             hyp = yaml.safe_load(f)
     LOGGER.info(colorstr("hyperparameters: ") + ", ".join(f"{k}={v}" for k, v in hyp.items()))
     opt.hyp = hyp.copy()
+
+    # ---- SNN hyperparameters from hyp.yaml (if CLI not provided) ----
+    # Priority: CLI > hyp.yaml > None
+    if getattr(opt, "snn_thresh", None) is None:
+        opt.snn_thresh = hyp.get("snn_thresh", None)
+    if getattr(opt, "snn_subthresh", None) is None:
+        opt.snn_subthresh = hyp.get("snn_subthresh", None)
+    if getattr(opt, "snn_tau", None) is None:
+        opt.snn_tau = hyp.get("snn_tau", None)
+    if getattr(opt, "snn_mem_init", None) is None:
+        opt.snn_mem_init = hyp.get("snn_mem_init", None)
+    if getattr(opt, "snn_spiking", None) is None:
+        v = hyp.get("snn_spiking", None)
+        opt.snn_spiking = int(v) if v is not None else None
 
     # Save run settings
     if not evolve:
@@ -206,15 +257,41 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
         else:
             model = Model(cfg, ch=3, nc=nc, anchors=hyp.get("anchors")).to(device)
 
+    # Print model summary (layers/params/trainable)
+    log_model_summary(model)
+
     amp = check_amp(model)
 
-    # Freeze
-    freeze = [f"model.{x}." for x in (freeze if len(freeze) > 1 else range(freeze[0]))]
-    for k, v in model.named_parameters():
-        v.requires_grad = True
-        if any(x in k for x in freeze):
-            LOGGER.info(f"freezing {k}")
-            v.requires_grad = False
+    # -----------------------------
+    # Freeze logic: ANN vs SNN
+    # -----------------------------
+    if opt.cfg in ("stbp_py", "solo_py"):
+        # SNN models (STBP / SOLO) use custom helpers on the class
+        if getattr(opt, "snn_freeze", "none") == "backbone":
+            LOGGER.info("SNN: freezing backbone (m0..m8)")
+            if hasattr(model, "freeze_backbone"):
+                model.freeze_backbone()
+            else:
+                LOGGER.warning("model has no freeze_backbone()")
+        elif getattr(opt, "snn_freeze", "none") == "detect_only":
+            LOGGER.info("SNN: freezing all modules except Detect")
+            if hasattr(model, "freeze_all_but_detect"):
+                model.freeze_all_but_detect()
+            else:
+                LOGGER.warning("model has no freeze_all_but_detect()")
+    else:
+        # ANN YOLOv3 (YAML-based) uses Ultralytics-style --freeze indices
+        # Special case: --freeze 999 -> freeze all but Detect (ANN).
+        if len(freeze) == 1 and int(freeze[0]) == 999:
+            LOGGER.info("ANN: freezing all modules except Detect (via --freeze 999)")
+            freeze_all_but_detect_ann(model)
+        else:
+            freeze_prefixes = [f"model.{x}." for x in (freeze if len(freeze) > 1 else range(freeze[0]))]
+            for k, v in model.named_parameters():
+                v.requires_grad = True
+                if any(x in k for x in freeze_prefixes):
+                    LOGGER.info(f"freezing {k}")
+                    v.requires_grad = False
 
     # Image size
     gs = max(int(model.stride.max()), 32)
@@ -339,8 +416,8 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
     maps = np.zeros(nc)
     results = (0, 0, 0, 0, 0, 0, 0)
     scheduler.last_epoch = start_epoch - 1
-    device_type = 'cuda' if device.type == 'cuda' else 'cpu'
-    # GradScaler: 손실 스케일링/step/update 담당
+    device_type = "cuda" if device.type == "cuda" else "cpu"
+    # GradScaler: handles loss scaling / step / update
     scaler = torch.amp.GradScaler(device_type, enabled=amp)
     stopper, stop = EarlyStopping(patience=opt.patience), False
     compute_loss = ComputeLoss(model)
@@ -353,11 +430,19 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
     )
     if RANK in {-1, 0}:
         if int(opt.accumulate) > 0:
-            LOGGER.info(colorstr(f"accumulate: using fixed --accumulate={int(opt.accumulate)} "
-                                 f"(effective batch size = {batch_size * int(opt.accumulate)})"))
+            LOGGER.info(
+                colorstr(
+                    f"accumulate: using fixed --accumulate={int(opt.accumulate)} "
+                    f"(effective batch size = {batch_size * int(opt.accumulate)})"
+                )
+            )
         else:
-            LOGGER.info(colorstr(f"accumulate: auto (nbs={nbs}) -> base={accumulate_base} "
-                                 f"(effective batch size ≈ {batch_size * accumulate_base})"))
+            LOGGER.info(
+                colorstr(
+                    f"accumulate: auto (nbs={nbs}) -> base={accumulate_base} "
+                    f"(effective batch size ≈ {batch_size * accumulate_base})"
+                )
+            )
 
     for epoch in range(start_epoch, epochs):
         callbacks.run("on_train_epoch_start")
@@ -465,6 +550,9 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
             ema.update_attr(model, include=["yaml", "nc", "hyp", "names", "stride", "class_weights"])
             final_epoch = (epoch + 1 == epochs) or stopper.possible_stop
             if not noval or final_epoch:
+                # Per-epoch visualization directory (optional)
+                epoch_save_dir = save_dir / f"epoch_{epoch}" if plots else save_dir
+
                 results, maps, _ = validate.run(
                     data_dict,
                     batch_size=batch_size // WORLD_SIZE * 2,
@@ -473,8 +561,8 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                     model=ema.ema,
                     single_cls=single_cls,
                     dataloader=val_loader,
-                    save_dir=save_dir,
-                    plots=False,
+                    save_dir=epoch_save_dir,
+                    plots=plots,  # enable plotting unless --noplots is used
                     callbacks=callbacks,
                     compute_loss=compute_loss,
                 )
@@ -555,9 +643,19 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
 def parse_opt(known=False):
     parser = argparse.ArgumentParser()
     parser.add_argument("--weights", type=str, default=ROOT / "yolov3-tiny.pt", help="initial weights path")
-    parser.add_argument("--cfg", type=str, default="", help="model.yaml path or 'stbp_py'/'solo_py' for SNN python model")
+    parser.add_argument(
+        "--cfg",
+        type=str,
+        default="",
+        help="model.yaml path or 'stbp_py'/'solo_py' for SNN python model",
+    )
     parser.add_argument("--data", type=str, default=ROOT / "data/coco128.yaml", help="dataset.yaml path")
-    parser.add_argument("--hyp", type=str, default=ROOT / "data/hyps/hyp.scratch-low.yaml", help="hyperparameters path")
+    parser.add_argument(
+        "--hyp",
+        type=str,
+        default=ROOT / "data/hyps/hyp.scratch-low.yaml",
+        help="hyperparameters path",
+    )
     parser.add_argument("--epochs", type=int, default=100, help="total training epochs")
     parser.add_argument("--batch-size", type=int, default=16, help="total batch size for all GPUs, -1 for autobatch")
     parser.add_argument("--imgsz", "--img", "--img-size", type=int, default=640, help="train, val image size (pixels)")
@@ -584,7 +682,13 @@ def parse_opt(known=False):
     parser.add_argument("--cos-lr", action="store_true", help="cosine LR scheduler")
     parser.add_argument("--label-smoothing", type=float, default=0.0, help="Label smoothing epsilon")
     parser.add_argument("--patience", type=int, default=100, help="EarlyStopping patience")
-    parser.add_argument("--freeze", nargs="+", type=int, default=[0], help="Freeze layers: backbone=10, first3=0 1 2")
+    parser.add_argument(
+        "--freeze",
+        nargs="+",
+        type=int,
+        default=[0],
+        help="Freeze layers: backbone=10, first3=0 1 2 (or 999 for Detect-only in ANN)",
+    )
     parser.add_argument("--save-period", type=int, default=-1, help="Save checkpoint every x epochs (disabled if < 1)")
     parser.add_argument("--seed", type=int, default=0, help="Global training seed")
     parser.add_argument("--local_rank", type=int, default=-1, help="Automatic DDP Multi-GPU argument, do not modify")
@@ -596,10 +700,22 @@ def parse_opt(known=False):
     parser.add_argument("--snn-tau", type=float, default=None)
     parser.add_argument("--snn-mem-init", type=float, default=None)
     parser.add_argument("--snn-spiking", type=int, default=None)  # 1 or 0
+    # ---- SNN-specific freezing strategy ----
+    parser.add_argument(
+        "--snn-freeze",
+        type=str,
+        default="none",
+        choices=["none", "backbone", "detect_only"],
+        help="SNN-only: 'backbone' to freeze m0..m8, 'detect_only' to train Detect head only",
+    )
 
     # ---- Gradient Accumulation ----
-    parser.add_argument("--accumulate", type=int, default=0,
-                        help="accumulate N batches before optimizer step; 0/neg for auto (nbs=64)")
+    parser.add_argument(
+        "--accumulate",
+        type=int,
+        default=0,
+        help="accumulate N batches before optimizer step; 0/neg for auto (nbs=64)",
+    )
 
     parser.add_argument("--entity", default=None, help="Weights & Biases entity (username/org)")
     parser.add_argument("--wb-project", default=None, help="Weights & Biases project name (optional)")
@@ -630,7 +746,7 @@ def main(opt, callbacks=Callbacks()):
     else:
         opt.data, opt.cfg, opt.hyp, opt.weights, opt.project = (
             check_file(opt.data),
-            (opt.cfg if opt.cfg in {"stbp_py", "solo_py"} else check_yaml(opt.cfg)),  # allow 'stbp_py' & 'solo_py' literals
+            (opt.cfg if opt.cfg in {"stbp_py", "solo_py"} else check_yaml(opt.cfg)),  # allow 'stbp_py' & 'solo_py'
             check_yaml(opt.hyp),
             str(opt.weights),
             str(opt.project),
@@ -715,7 +831,8 @@ def main(opt, callbacks=Callbacks()):
                 elif parent == "weighted":
                     x = (x * w.reshape(n, 1)).sum(0) / w.sum()
                 mp, s = 0.8, 0.2
-                npr = np.random; npr.seed(int(time.time()))
+                npr = np.random
+                npr.seed(int(time.time()))
                 g = np.array([meta[k][0] for k in hyp.keys()])
                 ng = len(meta)
                 v = np.ones(ng)

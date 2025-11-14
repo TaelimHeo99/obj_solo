@@ -1,0 +1,15 @@
+python train.py \
+  --cfg stbp_py \
+  --weights ' ' \
+  --data data/coco.yaml \
+  --hyp data/hyps/hyp.stbp.yaml \
+  --epochs 20 \
+  --batch-size 8 \
+  --imgsz 416 \
+  --num-steps 4 \
+  --snn-freeze none \
+  --snn-tau -1.1 \
+  --accumulate 2 \
+  --project runs/stbp \
+  --name stbp_pretrain_T4_tau-1.1 \
+  --device 0

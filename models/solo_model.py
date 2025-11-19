@@ -5,7 +5,7 @@
 # - SOLO-style loop: all early timesteps are no-grad; last timestep is grad-enabled
 # - Two detection scales: P4 (1/16), P5 (1/32)
 # - Ultralytics compatibility: self.model[-1] is Detect
-# - Batch-wise state reset available
+# - Batch-wise state reset available with safe batch/shape handling
 # - IMPORTANT: Adds YOLOv5-style Detect bias initialization here
 #   (no need to modify models/yolo.py)
 # ------------------------------------------------------------
@@ -70,7 +70,7 @@ class SOLO_YOLOTiny(nn.Module):
         log_every: int = 1,
         layers_to_log: Optional[Sequence[str]] = None,  # e.g., ["m1","m5","m10","m14"]
         reset_on_batch: bool = True,  # reset SNN states at the start of every batch (train)
-        log_reset: bool = False,  # log when states are reset (for verification)
+        log_reset: bool = False,      # log when states are reset (for verification)
     ):
         super().__init__()
 
@@ -142,7 +142,8 @@ class SOLO_YOLOTiny(nn.Module):
 
         # ---- lazy-state flags ----
         self._states_inited = False
-        self.hw = None  # (H, W) cache to detect resolution changes
+        self.hw = None        # (H, W) cache to detect resolution changes
+        self._state_B = None  # batch size used for current states
 
     # ---------------- helpers: states ----------------
     @torch.no_grad()
@@ -195,13 +196,19 @@ class SOLO_YOLOTiny(nn.Module):
         self.m14.init_state(y13)
         _ = self.m14.forward_step(y13)
 
-        # Mark states ready and record current resolution to avoid double init
+        # Mark states ready and record current resolution and batch size
         self._states_inited = True
         self.hw = (int(x.shape[2]), int(x.shape[3]))
+        self._state_B = int(x.shape[0])
 
     @torch.no_grad()
     def reset_states(self):
-        """Clear LIF states between sequences/batches."""
+        """
+        Clear LIF states between sequences/batches.
+
+        This does NOT allocate new states; it just clears internal buffers.
+        Actual shapes are re-established by _lazy_init_states(x).
+        """
         for m in [
             self.m1,
             self.m2,
@@ -218,10 +225,11 @@ class SOLO_YOLOTiny(nn.Module):
         ]:
             m.reset_state()
         self._states_inited = False
+        self._state_B = None
         if self.log_reset:
             tqdm.tqdm.write("[SNN] states reset")
 
-    # ---------------- helpers: freezing (NEW) ----------------
+    # ---------------- helpers: freezing ----------------
     def freeze_backbone(self):
         """
         Freeze SNN backbone (m0..m8) and keep head + Detect trainable.
@@ -283,19 +291,35 @@ class SOLO_YOLOTiny(nn.Module):
         Output:
             Detect head predictions from averaged P4/P5 features.
         """
-        # ---- batch-wise state reset (training) ----
-        if self.reset_on_batch and self.training:
-            if self._states_inited:
-                self.reset_states()
-            self._lazy_init_states(x)  # sets self.hw
-        else:
-            # Init or re-init only when resolution changes
-            if (not self._states_inited) or (self.hw != (x.shape[2], x.shape[3])):
-                self.reset_states()
-                self._lazy_init_states(x)
-
         B, _, H, W = x.shape
         dev = x.device
+
+        # ------------------------------------------------
+        # Safe state management:
+        # - If reset_on_batch and training  -> always reset + re-init
+        # - If batch size changes           -> reset + re-init
+        # - If resolution (H,W) changes     -> reset + re-init
+        # - If states not initialized yet   -> init
+        # This avoids mismatches like mem(B=16) vs input(B=8).
+        # ------------------------------------------------
+        need_reinit = False
+
+        if not self._states_inited:
+            # First call: states not yet allocated
+            need_reinit = True
+        elif self.hw != (H, W):
+            # Image resolution changed
+            need_reinit = True
+        elif self._state_B is None or self._state_B != B:
+            # Batch size changed (e.g., train batch=16 -> val batch=8)
+            need_reinit = True
+        elif self.reset_on_batch and self.training:
+            # Policy: always reset states at the start of each training batch
+            need_reinit = True
+
+        if need_reinit:
+            self.reset_states()
+            self._lazy_init_states(x)
 
         # Ensure Detect buffers are on the right device/dtype
         if isinstance(self.detect.stride, torch.Tensor):
@@ -343,8 +367,8 @@ class SOLO_YOLOTiny(nn.Module):
                     self._log_spike("m11", self.m11, t)
 
                     y12 = self.up(y11)
-                    y13 = self.cat([y12, y6])       # concat with backbone layer-6
-                    y14 = self.m14.forward_step(y13)  # P4 / 16
+                    y13 = self.cat([y12, y6])        # concat with backbone layer-6
+                    y14 = self.m14.forward_step(y13) # P4 / 16
                     self._log_spike("m14", self.m14, t)
 
                     # Accumulate without building autograd graph
@@ -382,7 +406,7 @@ class SOLO_YOLOTiny(nn.Module):
                 self._log_spike("m11", self.m11, t)
 
                 y12 = self.up(y11)
-                y13 = self.cat([y12, y6])        # concat with backbone layer-6
+                y13 = self.cat([y12, y6])         # concat with backbone layer-6
                 y14 = self.m14.forward_step(y13)  # P4 / 16
                 self._log_spike("m14", self.m14, t)
 

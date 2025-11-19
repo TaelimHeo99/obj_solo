@@ -163,12 +163,12 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
     )
     callbacks.run("on_pretrain_routine_start")
 
-    # Dirs
+    # Directories for weights and checkpoints
     w = save_dir / "weights"
     (w.parent if evolve else w).mkdir(parents=True, exist_ok=True)
     last, best = w / "last.pt", w / "best.pt"
 
-    # Hyps
+    # Hyperparameters
     if isinstance(hyp, str):
         with open(hyp, errors="ignore") as f:
             hyp = yaml.safe_load(f)
@@ -215,7 +215,7 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
     names = {0: "item"} if single_cls and len(data_dict["names"]) != 1 else data_dict["names"]
     is_coco = isinstance(val_path, str) and val_path.endswith("coco/val2017.txt")
 
-    # Model
+    # Model loading
     check_suffix(weights, ".pt")
     pretrained = weights.endswith(".pt")
 
@@ -232,7 +232,7 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
         with torch_distributed_zero_first(LOCAL_RANK):
             weights = attempt_download(weights)
         ckpt = torch_load(weights, map_location="cpu")
-        # choose model impl
+        # Choose model implementation (SNN python or YAML-based)
         if opt.cfg == "stbp_py":
             anchors = ((10, 14, 23, 27, 37, 58), (81, 82, 135, 169, 344, 319))
             model = STBP_YOLOTiny(nc=nc, anchors=anchors, num_steps=opt.num_steps).to(device)
@@ -297,7 +297,7 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
     gs = max(int(model.stride.max()), 32)
     imgsz = check_img_size(opt.imgsz, gs, floor=gs * 2)
 
-    # Batch size
+    # Batch size (autobatch if requested)
     if RANK == -1 and batch_size == -1:
         batch_size = check_train_batch_size(model, imgsz, amp)
         loggers.on_params_update({"batch_size": batch_size})
@@ -305,7 +305,7 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
     # -----------------------------
     # Optimizer + Accumulation
     # -----------------------------
-    # nbs is the nominal batch size used to scale hyperparams (as in YOLOv5)
+    # nbs is the nominal batch size used to scale hyperparameters (as in YOLOv5)
     nbs = 64
     # If user passes --accumulate > 0, use it; otherwise use auto accumulate = ceil(nbs / batch)
     accumulate_base = int(opt.accumulate) if int(opt.accumulate) > 0 else max(round(nbs / batch_size), 1)
@@ -319,8 +319,10 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
     if opt.cos_lr:
         lf = one_cycle(1, hyp["lrf"], epochs)
     else:
+
         def lf(x):
             return (1 - x / epochs) * (1.0 - hyp["lrf"]) + hyp["lrf"]
+
     scheduler = lr_scheduler.LambdaLR(optimizer, lr_lambda=lf)
 
     # EMA
@@ -333,19 +335,19 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
             best_fitness, start_epoch, epochs = smart_resume(ckpt, optimizer, ema, weights, epochs, resume)
         del ckpt, csd
 
-    # DP mode
+    # DataParallel
     if cuda and RANK == -1 and torch.cuda.device_count() > 1:
         LOGGER.warning(
             "WARNING ⚠️ DP not recommended, use torch.distributed.run for best DDP Multi-GPU results."
         )
         model = torch.nn.DataParallel(model)
 
-    # SyncBN
+    # SyncBatchNorm (DDP only)
     if opt.sync_bn and cuda and RANK != -1:
         model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model).to(device)
         LOGGER.info("Using SyncBatchNorm()")
 
-    # Trainloader
+    # Train dataloader
     train_loader, dataset = create_dataloader(
         train_path,
         imgsz,
@@ -368,7 +370,7 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
     mlc = int(labels[:, 0].max())
     assert mlc < nc, f"Label class {mlc} exceeds nc={nc} in {data}. Possible class labels are 0-{nc - 1}"
 
-    # Process 0
+    # Validation dataloader (only on main process)
     if RANK in {-1, 0}:
         val_loader = create_dataloader(
             val_path,
@@ -393,12 +395,12 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
 
         callbacks.run("on_pretrain_routine_end", labels, names)
 
-    # DDP
+    # DDP wrapper
     if cuda and RANK != -1:
         model = smart_DDP(model)
 
-    # Model attributes
-    nl = de_parallel(model).model[-1].nl  # Detect layers
+    # Model attributes for loss scaling
+    nl = de_parallel(model).model[-1].nl  # number of Detect layers
     hyp["box"] *= 3 / nl
     hyp["cls"] *= nc / 80 * 3 / nl
     hyp["obj"] *= (imgsz / 640) ** 2 * 3 / nl
@@ -408,16 +410,16 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
     model.class_weights = labels_to_class_weights(dataset.labels, nc).to(device) * nc
     model.names = names
 
-    # Train
+    # Training loop
     t0 = time.time()
     nb = len(train_loader)
-    nw = max(round(hyp["warmup_epochs"] * nb), 100)  # warmup steps
+    nw = max(round(hyp["warmup_epochs"] * nb), 100)  # number of warmup steps
     last_opt_step = -1
     maps = np.zeros(nc)
     results = (0, 0, 0, 0, 0, 0, 0)
     scheduler.last_epoch = start_epoch - 1
     device_type = "cuda" if device.type == "cuda" else "cpu"
-    # GradScaler: handles loss scaling / step / update
+    # GradScaler handles loss scaling and optimizer steps (for mixed precision)
     scaler = torch.amp.GradScaler(device_type, enabled=amp)
     stopper, stop = EarlyStopping(patience=opt.patience), False
     compute_loss = ComputeLoss(model)
@@ -448,7 +450,7 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
         callbacks.run("on_train_epoch_start")
         model.train()
 
-        # Image weights
+        # Optional image weighting (for rare classes, etc.)
         if opt.image_weights:
             cw = model.class_weights.cpu().numpy() * (1 - maps) ** 2 / nc
             iw = labels_to_image_weights(dataset.labels, nc=nc, class_weights=cw)
@@ -465,20 +467,19 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
 
         for i, (imgs, targets, paths, _) in pbar:
             callbacks.run("on_train_batch_start")
-            ni = i + nb * epoch
-            imgs = imgs.to(device, non_blocking=True).float() / 255
+            ni = i + nb * epoch  # training step index
+            imgs = imgs.to(device, non_blocking=True).float() / 255.0
 
             # -----------------------------
             # Warmup & dynamic accumulate
             # -----------------------------
-            # During warmup we may gradually change LR/momentum and optionally interpolate accumulate.
             if ni <= nw:
                 xi = [0, nw]
-                # if user set --accumulate > 0, keep it fixed; else interpolate auto accumulate
+                # If user set --accumulate > 0, keep it fixed; else interpolate auto accumulate
                 if int(opt.accumulate) > 0:
                     accumulate_now = int(opt.accumulate)
                 else:
-                    # linearly ramp from 1 -> accumulate_base during warmup
+                    # Linearly ramp from 1 -> accumulate_base during warmup
                     accumulate_now = int(max(1, np.interp(ni, xi, [1, accumulate_base]).round()))
                 for j, x in enumerate(optimizer.param_groups):
                     x["lr"] = np.interp(
@@ -489,7 +490,7 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
             else:
                 accumulate_now = int(opt.accumulate) if int(opt.accumulate) > 0 else accumulate_base
 
-            # Multi-scale
+            # Multi-scale training (resize images on the fly)
             if opt.multi_scale:
                 sz = random.randrange(int(imgsz * 0.5), int(imgsz * 1.5) + gs) // gs * gs
                 sf = sz / max(imgs.shape[2:])
@@ -498,7 +499,7 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                     imgs = nn.functional.interpolate(imgs, size=ns, mode="bilinear", align_corners=False)
 
             with torch.amp.autocast(device_type, enabled=amp):
-                # reset SNN states per batch (no-op for YAML models)
+                # Reset SNN states per batch for SNN models (no-op for YAML models)
                 if hasattr(model, "reset_states"):
                     model.reset_states()
 
@@ -509,15 +510,15 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                 loss = loss / float(accumulate_now)
 
                 if RANK != -1:
-                    # For DDP, scale to world size (kept from original)
+                    # For DDP, scale to world size
                     loss *= WORLD_SIZE
                 if opt.quad:
                     loss *= 4.0
 
-            # Backward
+            # Backward pass
             scaler.scale(loss).backward()
 
-            # Optimize when reaching the accumulation boundary
+            # Optimizer step when reaching the accumulation boundary
             # We use modulo on local batch index to avoid drift when resuming
             if ((i + 1) % accumulate_now == 0) or (i == nb - 1):
                 scaler.unscale_(optimizer)
@@ -529,7 +530,7 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                     ema.update(model)
                 last_opt_step = ni
 
-            # Log
+            # Logging
             if RANK in {-1, 0}:
                 mloss = (mloss * i + loss_items) / (i + 1)
                 mem = f"{torch.cuda.memory_reserved() / 1e9 if torch.cuda.is_available() else 0:.3g}G"
@@ -541,7 +542,7 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                 if callbacks.stop_training:
                     return
 
-        # Scheduler
+        # Scheduler step
         lr = [x["lr"] for x in optimizer.param_groups]
         scheduler.step()
 
@@ -551,7 +552,12 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
             final_epoch = (epoch + 1 == epochs) or stopper.possible_stop
             if not noval or final_epoch:
                 # Per-epoch visualization directory (optional)
-                epoch_save_dir = save_dir / f"epoch_{epoch}" if plots else save_dir
+                if plots:
+                    epoch_save_dir = save_dir / f"epoch_{epoch}"
+                    # Ensure directory exists before any plotting threads save images
+                    epoch_save_dir.mkdir(parents=True, exist_ok=True)
+                else:
+                    epoch_save_dir = save_dir
 
                 results, maps, _ = validate.run(
                     data_dict,
@@ -574,7 +580,7 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
             log_vals = list(mloss) + list(results) + lr
             callbacks.run("on_fit_epoch_end", log_vals, epoch, best_fitness, fi)
 
-            # ---- drop SNN runtime states before deepcopy to keep ckpt small & safe ----
+            # ---- Drop SNN runtime states before deepcopy to keep ckpt small & safe ----
             m_par = de_parallel(model)
             if hasattr(m_par, "reset_states"):
                 m_par.reset_states()
@@ -582,7 +588,7 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
             if ema_par is not None and hasattr(ema_par, "reset_states"):
                 ema_par.reset_states()
 
-            # Save
+            # Save checkpoints
             if (not nosave) or (final_epoch and not evolve):
                 ckpt = {
                     "epoch": epoch,
@@ -603,7 +609,7 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                 del ckpt
                 callbacks.run("on_model_save", last, epoch, final_epoch, best_fitness, fi)
 
-        # EarlyStopping
+        # EarlyStopping across DDP ranks
         if RANK != -1:
             broadcast_list = [stop if RANK == 0 else None]
             dist.broadcast_object_list(broadcast_list, 0)
@@ -612,7 +618,7 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
         if stop:
             break
 
-    # end training
+    # End of training
     if RANK in {-1, 0}:
         LOGGER.info(f"\n{epoch - start_epoch + 1} epochs completed in {(time.time() - t0) / 3600:.3f} hours.")
         for f in last, best:
@@ -695,11 +701,11 @@ def parse_opt(known=False):
 
     # ---- SNN options (ignored by YAML models) ----
     parser.add_argument("--num-steps", type=int, default=5, help="SNN time steps")
-    parser.add_argument("--snn-thresh", type=float, default=None)
-    parser.add_argument("--snn-subthresh", type=float, default=None)
-    parser.add_argument("--snn-tau", type=float, default=None)
-    parser.add_argument("--snn-mem-init", type=float, default=None)
-    parser.add_argument("--snn-spiking", type=int, default=None)  # 1 or 0
+    parser.add_argument("--snn-thresh", type=float, default=None, help="SNN threshold (surrogate spike)")
+    parser.add_argument("--snn-subthresh", type=float, default=None, help="SNN subthreshold scaling")
+    parser.add_argument("--snn-tau", type=float, default=None, help="SNN LIF time constant")
+    parser.add_argument("--snn-mem-init", type=float, default=None, help="SNN membrane initial value")
+    parser.add_argument("--snn-spiking", type=int, default=None, help="SNN spiking mode flag (1 or 0)")
     # ---- SNN-specific freezing strategy ----
     parser.add_argument(
         "--snn-freeze",
@@ -729,7 +735,7 @@ def main(opt, callbacks=Callbacks()):
         check_git_status()
         check_requirements(ROOT / "requirements.txt")
 
-    # Resume
+    # Resume logic
     if opt.resume and not check_comet_resume(opt) and not opt.evolve:
         last = Path(check_file(opt.resume) if isinstance(opt.resume, str) else get_latest_run())
         opt_yaml = last.parent.parent / "opt.yaml"
@@ -760,7 +766,7 @@ def main(opt, callbacks=Callbacks()):
             opt.name = Path(opt.cfg).stem
         opt.save_dir = str(increment_path(Path(opt.project) / opt.name, exist_ok=opt.exist_ok))
 
-    # DDP
+    # Device and DDP setup
     device = select_device(opt.device, batch_size=opt.batch_size)
     if LOCAL_RANK != -1:
         msg = "is not compatible with YOLOv3 Multi-GPU DDP training"
@@ -777,7 +783,7 @@ def main(opt, callbacks=Callbacks()):
     if not opt.evolve:
         train(opt.hyp, opt, device, callbacks)
     else:
-        # (kept same as original)
+        # Hyperparameter evolution (kept same as original)
         meta = {
             "lr0": (1, 1e-5, 1e-1),
             "lrf": (1, 0.01, 1.0),

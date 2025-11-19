@@ -4,7 +4,7 @@
 # - Temporal loop outside; each _ms block holds internal LIF states
 # - Two detection scales: P4 (1/16), P5 (1/32)
 # - Ultralytics compatibility: self.model[-1] is Detect
-# - Batch-wise state reset available
+# - Batch-wise state reset with safe handling of batch/shape changes
 # - IMPORTANT: Adds YOLOv5-style Detect bias initialization here
 #   (no need to modify models/yolo.py)
 # ------------------------------------------------------------
@@ -68,8 +68,8 @@ class STBP_YOLOTiny(nn.Module):
         log_spike: bool = False,
         log_every: int = 1,
         layers_to_log: Optional[Sequence[str]] = None,  # e.g., ["m1","m5","m10","m14"]
-        reset_on_batch: bool = True,  # reset SNN states at the start of every batch (train)
-        log_reset: bool = False,  # log when states are reset (for verification)
+        reset_on_batch: bool = True,  # reset SNN states at the start of every batch
+        log_reset: bool = False,      # log when states are reset (for verification)
     ):
         super().__init__()
 
@@ -110,23 +110,25 @@ class STBP_YOLOTiny(nn.Module):
         self.m9 = BasicBlock_ms(512, 256, k=3, s=1)    # 9
         self.m10 = ConcatBlock_ms(256, 512, k=3, s=1)  # 10 (P5/32)
         self.m11 = BasicBlock_ms(256, 128, k=1, s=1)   # 11 (from layer 9)
-        self.up = Sample(None, 2, "nearest")           # 12
-        self.cat = Concat(dim=1)                       # 13
+        self.up = Sample(None, 2, "nearest")           # 12 (nearest-neighbor upsample)
+        self.cat = Concat(dim=1)                       # 13 (channel-wise concat)
         self.m14 = BasicBlock_ms(384, 256, k=3, s=1)   # 14 (P4/16)
 
         # ---------------- Detect ----------------
         self.detect = Detect(nc=self.nc, anchors=anchors, ch=[256, 512], inplace=True)
-        self.detect.stride = torch.tensor([16.0, 32.0])  # P4, P5
-        self.stride = self.detect.stride  # compatibility with some utils
+        # Strides for P4, P5
+        self.detect.stride = torch.tensor([16.0, 32.0])
+        # Expose stride for Ultralytics-style utilities
+        self.stride = self.detect.stride
         check_anchor_order(self.detect)
 
-        # Normalize anchors and initialize biases (done here so yolo.py is untouched)
+        # Normalize anchors and initialize biases (YOLOv5-style)
         with torch.no_grad():
             # Normalize anchors by stride (standard YOLO practice)
             self.detect.anchors /= self.detect.stride.view(-1, 1, 1)
 
             # ---- YOLOv5-style Detect bias initialization ----
-            # This accelerates early training by providing useful priors for obj and cls.
+            # Accelerates early training by providing useful priors for obj and cls.
             # (Assume ~8 objects per 640x640 image; uniform class prior if cf is unknown.)
             for mi, s in zip(self.detect.m, self.detect.stride):
                 b = mi.bias.view(self.detect.na, -1)  # (na, 5+nc)
@@ -141,7 +143,8 @@ class STBP_YOLOTiny(nn.Module):
 
         # ---- lazy-state flags ----
         self._states_inited = False
-        self.hw = None  # (H, W) cache to detect resolution changes
+        self.hw = None          # (H, W) cache to detect resolution changes
+        self._state_B = None    # batch size used for current states
 
     # ---------------- helpers: states ----------------
     @torch.no_grad()
@@ -194,13 +197,19 @@ class STBP_YOLOTiny(nn.Module):
         self.m14.init_state(y13)
         _ = self.m14.forward_step(y13)
 
-        # Mark states ready and record current resolution to avoid double init
+        # Mark states ready and record current resolution and batch size
         self._states_inited = True
         self.hw = (int(x.shape[2]), int(x.shape[3]))
+        self._state_B = int(x.shape[0])
 
     @torch.no_grad()
     def reset_states(self):
-        """Clear LIF states between sequences/batches."""
+        """
+        Clear LIF states between sequences/batches.
+
+        This does NOT allocate new states; it just clears internal buffers.
+        Actual shapes are re-established by _lazy_init_states(x).
+        """
         for m in [
             self.m1,
             self.m2,
@@ -217,10 +226,11 @@ class STBP_YOLOTiny(nn.Module):
         ]:
             m.reset_state()
         self._states_inited = False
+        self._state_B = None
         if self.log_reset:
             tqdm.tqdm.write("[SNN] states reset")
 
-    # ---------------- helpers: freezing (NEW) ----------------
+    # ---------------- helpers: freezing ----------------
     def freeze_backbone(self):
         """
         Freeze SNN backbone (m0..m8) and keep head + Detect trainable.
@@ -281,19 +291,35 @@ class STBP_YOLOTiny(nn.Module):
         Output:
             Detect head predictions from averaged P4/P5 features
         """
-        # ---- batch-wise state reset (training) ----
-        if self.reset_on_batch and self.training:
-            if self._states_inited:
-                self.reset_states()
-            self._lazy_init_states(x)  # sets self.hw
-        else:
-            # Init or re-init only when resolution changes
-            if (not self._states_inited) or (self.hw != (x.shape[2], x.shape[3])):
-                self.reset_states()
-                self._lazy_init_states(x)
-
         B, _, H, W = x.shape
         dev = x.device
+
+        # ------------------------------------------------
+        # Safe state management:
+        # - If reset_on_batch and training  -> always reset + re-init
+        # - If batch size changes           -> reset + re-init
+        # - If resolution (H,W) changes     -> reset + re-init
+        # - If states not initialized yet   -> init
+        # This avoids mismatches like mem(B=16) vs input(B=8).
+        # ------------------------------------------------
+        need_reinit = False
+
+        if not self._states_inited:
+            # First call: states not yet allocated
+            need_reinit = True
+        elif self.hw != (H, W):
+            # Image resolution changed
+            need_reinit = True
+        elif self._state_B is None or self._state_B != B:
+            # Batch size changed (e.g., train batch=16 -> val batch=8)
+            need_reinit = True
+        elif self.reset_on_batch and self.training:
+            # Policy: always reset states at the start of each training batch
+            need_reinit = True
+
+        if need_reinit:
+            self.reset_states()
+            self._lazy_init_states(x)
 
         # Ensure Detect buffers are on the right device/dtype
         if isinstance(self.detect.stride, torch.Tensor):
@@ -304,7 +330,7 @@ class STBP_YOLOTiny(nn.Module):
         P4 = torch.zeros(B, 256, H // 16, W // 16, device=dev, dtype=torch.float32)
         P5 = torch.zeros(B, 512, H // 32, W // 32, device=dev, dtype=torch.float32)
 
-        # Temporal loop
+        # ---------------- Temporal loop ----------------
         for t in range(self.num_steps):
             # Backbone
             y0 = self.m0(x)  # non-spiking stem
@@ -336,8 +362,8 @@ class STBP_YOLOTiny(nn.Module):
             self._log_spike("m11", self.m11, t)
 
             y12 = self.up(y11)
-            y13 = self.cat([y12, y6])       # concat with backbone layer-6
-            y14 = self.m14.forward_step(y13)  # P4 / 16
+            y13 = self.cat([y12, y6])          # concat with backbone layer-6
+            y14 = self.m14.forward_step(y13)   # P4 / 16
             self._log_spike("m14", self.m14, t)
 
             # Accumulate (cast to float32 to match accumulators under AMP)
@@ -348,5 +374,5 @@ class STBP_YOLOTiny(nn.Module):
         P4 /= self.num_steps
         P5 /= self.num_steps
 
-        # Detect once
+        # Detect once on time-averaged features
         return self.detect([P4, P5])

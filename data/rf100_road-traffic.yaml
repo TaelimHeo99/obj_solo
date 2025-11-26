@@ -1,0 +1,28 @@
+# Road Traffic dataset (Roboflow100)
+# YOLOv3-style COCO format yaml
+# Example usage:
+#   python train.py --data data/road-traffic.yaml
+
+# Dataset root
+path: /home/taelim/workspace/obj_solo/datasets/rf100/road-traffic
+
+# Train/Val/Test split (txt file listing all images)
+train: train.txt
+val: valid.txt
+test: test.txt
+
+# Classes
+nc: 12
+names:
+  0: bicycles
+  1: bridges
+  2: buses
+  3: chimneys
+  4: crosswalks
+  5: fire hydrants
+  6: motorcycles
+  7: stairs
+  8: taxis
+  9: tractors
+  10: traffic lights
+  11: vehicles

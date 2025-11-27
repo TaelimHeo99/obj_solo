@@ -279,6 +279,9 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                 model.freeze_all_but_detect()
             else:
                 LOGGER.warning("model has no freeze_all_but_detect()")
+
+
+
     else:
         # ANN YOLOv3 (YAML-based) uses Ultralytics-style --freeze indices
         # Special case: --freeze 999 -> freeze all but Detect (ANN).
@@ -292,6 +295,10 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                 if any(x in k for x in freeze_prefixes):
                     LOGGER.info(f"freezing {k}")
                     v.requires_grad = False
+
+    n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    n_total = sum(p.numel() for p in model.parameters())
+    LOGGER.info(f"After freeze: {n_trainable:,}/{n_total:,} trainable params")
 
     # Image size
     gs = max(int(model.stride.max()), 32)

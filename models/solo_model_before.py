@@ -1,10 +1,11 @@
 # ------------------------------------------------------------
-# Spiking YOLOv3-tiny (STBP_YOLOTiny)
+# Spiking YOLOv3-tiny (SOLO_YOLOTiny)
 # - Mirrors a tiny YOLO topology with spiking blocks (LCB order)
 # - Temporal loop outside; each _ms block holds internal LIF states
+# - SOLO-style loop: all early timesteps are no-grad; last timestep is grad-enabled
 # - Two detection scales: P4 (1/16), P5 (1/32)
 # - Ultralytics compatibility: self.model[-1] is Detect
-# - Batch-wise state reset with safe handling of batch/shape changes
+# - Batch-wise state reset available with safe batch/shape handling
 # - IMPORTANT: Adds YOLOv5-style Detect bias initialization here
 #   (no need to modify models/yolo.py)
 # ------------------------------------------------------------
@@ -30,7 +31,7 @@ from models.yolo import Detect
 from utils.autoanchor import check_anchor_order
 
 
-class STBP_YOLOTiny(nn.Module):
+class SOLO_YOLOTiny(nn.Module):
     """
     Spiking YOLOv3-tiny reimplementation (LCB per stage, time-loop outside).
 
@@ -68,7 +69,7 @@ class STBP_YOLOTiny(nn.Module):
         log_spike: bool = False,
         log_every: int = 1,
         layers_to_log: Optional[Sequence[str]] = None,  # e.g., ["m1","m5","m10","m14"]
-        reset_on_batch: bool = True,  # reset SNN states at the start of every batch
+        reset_on_batch: bool = True,  # reset SNN states at the start of every batch (train)
         log_reset: bool = False,      # log when states are reset (for verification)
     ):
         super().__init__()
@@ -110,25 +111,23 @@ class STBP_YOLOTiny(nn.Module):
         self.m9 = BasicBlock_ms(512, 256, k=3, s=1)    # 9
         self.m10 = ConcatBlock_ms(256, 512, k=3, s=1)  # 10 (P5/32)
         self.m11 = BasicBlock_ms(256, 128, k=1, s=1)   # 11 (from layer 9)
-        self.up = Sample(None, 2, "nearest")           # 12 (nearest-neighbor upsample)
-        self.cat = Concat(dim=1)                       # 13 (channel-wise concat)
+        self.up = Sample(None, 2, "nearest")           # 12
+        self.cat = Concat(dim=1)                       # 13
         self.m14 = BasicBlock_ms(384, 256, k=3, s=1)   # 14 (P4/16)
 
         # ---------------- Detect ----------------
         self.detect = Detect(nc=self.nc, anchors=anchors, ch=[256, 512], inplace=True)
-        # Strides for P4, P5
-        self.detect.stride = torch.tensor([16.0, 32.0])
-        # Expose stride for Ultralytics-style utilities
-        self.stride = self.detect.stride
+        self.detect.stride = torch.tensor([16.0, 32.0])  # P4, P5
+        self.stride = self.detect.stride  # compatibility with some utils
         check_anchor_order(self.detect)
 
-        # Normalize anchors and initialize biases (YOLOv5-style)
+        # Normalize anchors and initialize biases (done here so yolo.py is untouched)
         with torch.no_grad():
             # Normalize anchors by stride (standard YOLO practice)
             self.detect.anchors /= self.detect.stride.view(-1, 1, 1)
 
             # ---- YOLOv5-style Detect bias initialization ----
-            # Accelerates early training by providing useful priors for obj and cls.
+            # This accelerates early training by providing useful priors for obj and cls.
             # (Assume ~8 objects per 640x640 image; uniform class prior if cf is unknown.)
             for mi, s in zip(self.detect.m, self.detect.stride):
                 b = mi.bias.view(self.detect.na, -1)  # (na, 5+nc)
@@ -143,13 +142,8 @@ class STBP_YOLOTiny(nn.Module):
 
         # ---- lazy-state flags ----
         self._states_inited = False
-        self.hw = None          # (H, W) cache to detect resolution changes
-        self._state_B = None    # batch size used for current states
-
-        # ---- spike statistics for firing rate ----
-        # These are per-forward (per-batch) stats, used by the trainer.
-        self.last_batch_spikes = 0.0
-        self.last_batch_neuron_steps = 0.0
+        self.hw = None        # (H, W) cache to detect resolution changes
+        self._state_B = None  # batch size used for current states
 
     # ---------------- helpers: states ----------------
     @torch.no_grad()
@@ -235,22 +229,6 @@ class STBP_YOLOTiny(nn.Module):
         if self.log_reset:
             tqdm.tqdm.write("[SNN] states reset")
 
-    # ---------------- helpers: firing-rate stats ----------------
-    def _accumulate_spike_stats(self, module: nn.Module, B: int):
-        """
-        Accumulate spike statistics for firing-rate computation.
-
-        Assumes spiking blocks store their last spikes in module.last_spk
-        with shape [B, ...].
-        """
-        if not hasattr(module, "last_spk") or module.last_spk is None:
-            return
-        with torch.no_grad():
-            spk = module.last_spk
-            self.last_batch_spikes += float(spk.float().sum().item())
-            # (#neurons per sample) * batch_size * 1 timestep
-            self.last_batch_neuron_steps += float(spk[0].numel() * B)
-
     # ---------------- helpers: freezing ----------------
     def freeze_backbone(self):
         """
@@ -304,13 +282,14 @@ class STBP_YOLOTiny(nn.Module):
     # ---------------- forward ----------------
     def forward(self, x: torch.Tensor):
         """
-        Top-level SNN forward with temporal accumulation.
+        SOLO-style temporal accumulation:
+        - For t < num_steps-1: update spike/membrane states under no-grad.
+        - For t == num_steps-1: run with gradient enabled.
 
         Input:
             x: [B, 3, H, W]
-
         Output:
-            Detect head predictions from averaged P4/P5 features
+            Detect head predictions from averaged P4/P5 features.
         """
         B, _, H, W = x.shape
         dev = x.device
@@ -351,70 +330,93 @@ class STBP_YOLOTiny(nn.Module):
         P4 = torch.zeros(B, 256, H // 16, W // 16, device=dev, dtype=torch.float32)
         P5 = torch.zeros(B, 512, H // 32, W // 32, device=dev, dtype=torch.float32)
 
-        # Reset batch spike statistics
-        self.last_batch_spikes = 0.0
-        self.last_batch_neuron_steps = 0.0
-
-        # ---------------- Temporal loop ----------------
+        # ---------------- SOLO temporal loop ----------------
         for t in range(self.num_steps):
-            # Backbone
-            y0 = self.m0(x)  # non-spiking stem
+            is_last = (t == self.num_steps - 1)
 
-            y1 = self.m1.forward_step(y0)
-            self._accumulate_spike_stats(self.m1, B)
-            self._log_spike("m1", self.m1, t)
+            # Early timesteps: no-grad (state updates only), last timestep: grad on
+            if not is_last:
+                with torch.no_grad():
+                    # Backbone
+                    y0 = self.m0(x)  # non-spiking stem (stateless)
+                    y1 = self.m1.forward_step(y0)
+                    self._log_spike("m1", self.m1, t)
 
-            y2 = self.m2.forward_step(y1)
-            self._accumulate_spike_stats(self.m2, B)
-            self._log_spike("m2", self.m2, t)
+                    y2 = self.m2.forward_step(y1)
+                    self._log_spike("m2", self.m2, t)
 
-            y3 = self.m3.forward_step(y2)
-            self._accumulate_spike_stats(self.m3, B)
-            self._log_spike("m3", self.m3, t)
+                    y3 = self.m3.forward_step(y2)
+                    self._log_spike("m3", self.m3, t)
 
-            y4 = self.m4.forward_step(y3)
-            self._accumulate_spike_stats(self.m4, B)
+                    y4 = self.m4.forward_step(y3)
+                    y5 = self.m5.forward_step(y4)  # P4 / 16
+                    self._log_spike("m5", self.m5, t)
 
-            y5 = self.m5.forward_step(y4)  # P4 / 16
-            self._accumulate_spike_stats(self.m5, B)
-            self._log_spike("m5", self.m5, t)
+                    y6 = self.m6.forward_step(y5)
+                    y7 = self.m7.forward_step(y6)
+                    self._log_spike("m7", self.m7, t)
 
-            y6 = self.m6.forward_step(y5)
-            self._accumulate_spike_stats(self.m6, B)
+                    y8 = self.m8.forward_step(y7)  # / 32
 
-            y7 = self.m7.forward_step(y6)
-            self._accumulate_spike_stats(self.m7, B)
-            self._log_spike("m7", self.m7, t)
+                    # Head
+                    y9 = self.m9.forward_step(y8)
+                    y10 = self.m10.forward_step(y9)  # P5 / 32
+                    self._log_spike("m10", self.m10, t)
 
-            y8 = self.m8.forward_step(y7)
-            self._accumulate_spike_stats(self.m8, B)
+                    y11 = self.m11.forward_step(y9)  # from layer 9
+                    self._log_spike("m11", self.m11, t)
 
-            # Head
-            y9 = self.m9.forward_step(y8)
-            self._accumulate_spike_stats(self.m9, B)
+                    y12 = self.up(y11)
+                    y13 = self.cat([y12, y6])        # concat with backbone layer-6
+                    y14 = self.m14.forward_step(y13) # P4 / 16
+                    self._log_spike("m14", self.m14, t)
 
-            y10 = self.m10.forward_step(y9)  # P5 / 32
-            self._accumulate_spike_stats(self.m10, B)
-            self._log_spike("m10", self.m10, t)
+                    # Accumulate without building autograd graph
+                    P4 += y14.float()
+                    P5 += y10.float()
+            else:
+                # Last timestep: gradient-enabled pass
+                # Backbone
+                y0 = self.m0(x)  # non-spiking stem
+                y1 = self.m1.forward_step(y0)
+                self._log_spike("m1", self.m1, t)
 
-            y11 = self.m11.forward_step(y9)  # from layer 9
-            self._accumulate_spike_stats(self.m11, B)
-            self._log_spike("m11", self.m11, t)
+                y2 = self.m2.forward_step(y1)
+                self._log_spike("m2", self.m2, t)
 
-            y12 = self.up(y11)
-            y13 = self.cat([y12, y6])          # concat with backbone layer-6
+                y3 = self.m3.forward_step(y2)
+                self._log_spike("m3", self.m3, t)
 
-            y14 = self.m14.forward_step(y13)   # P4 / 16
-            self._accumulate_spike_stats(self.m14, B)
-            self._log_spike("m14", self.m14, t)
+                y4 = self.m4.forward_step(y3)
+                y5 = self.m5.forward_step(y4)  # P4 / 16
+                self._log_spike("m5", self.m5, t)
 
-            # Accumulate (cast to float32 to match accumulators under AMP)
-            P4 += y14.float()
-            P5 += y10.float()
+                y6 = self.m6.forward_step(y5)
+                y7 = self.m7.forward_step(y6)
+                self._log_spike("m7", self.m7, t)
 
-        # Average over time
+                y8 = self.m8.forward_step(y7)  # / 32
+
+                # Head
+                y9 = self.m9.forward_step(y8)
+                y10 = self.m10.forward_step(y9)  # P5 / 32
+                self._log_spike("m10", self.m10, t)
+
+                y11 = self.m11.forward_step(y9)  # from layer 9
+                self._log_spike("m11", self.m11, t)
+
+                y12 = self.up(y11)
+                y13 = self.cat([y12, y6])         # concat with backbone layer-6
+                y14 = self.m14.forward_step(y13)  # P4 / 16
+                self._log_spike("m14", self.m14, t)
+
+                # Accumulate with gradient attached for the last-step terms
+                P4 += y14.float()
+                P5 += y10.float()
+
+        # Average over time (last step carries grad; earlier steps were no-grad)
         P4 /= self.num_steps
         P5 /= self.num_steps
 
-        # Detect once on time-averaged features
+        # Detect once
         return self.detect([P4, P5])

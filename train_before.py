@@ -23,7 +23,6 @@ import time
 from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
-import csv  # <-- firing-rate logging
 
 try:
     import comet_ml  # must be imported before torch (if installed)
@@ -53,7 +52,7 @@ from models.yolo import Detect  # for type hints if needed
 
 # ---- SNN imports (safe to import even when using YAML models) ----
 from models.stbp_model import STBP_YOLOTiny
-from models.solo_model_before import SOLO_YOLOTiny
+from models.solo_model import SOLO_YOLOTiny
 from models.snn_block import set_global_snn
 
 from utils.autoanchor import check_anchors
@@ -281,6 +280,8 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
             else:
                 LOGGER.warning("model has no freeze_all_but_detect()")
 
+
+
     else:
         # ANN YOLOv3 (YAML-based) uses Ultralytics-style --freeze indices
         # Special case: --freeze 999 -> freeze all but Detect (ANN).
@@ -452,18 +453,9 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                 )
             )
 
-    # ---- global firing-rate accumulators ----
-    global_spikes = 0.0
-    global_neuron_steps = 0.0
-    firing_csv_path = save_dir / "firing_rate.csv"
-
     for epoch in range(start_epoch, epochs):
         callbacks.run("on_train_epoch_start")
         model.train()
-
-        # ---- per-epoch firing stats ----
-        epoch_spikes = 0.0
-        epoch_neuron_steps = 0.0
 
         # Optional image weighting (for rare classes, etc.)
         if opt.image_weights:
@@ -519,20 +511,6 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                     model.reset_states()
 
                 pred = model(imgs)
-
-                # ---- SNN firing stats (if available) ----
-                m_for_stats = model.module if hasattr(model, "module") else model
-                if hasattr(m_for_stats, "last_batch_spikes") and hasattr(
-                    m_for_stats, "last_batch_neuron_steps"
-                ):
-                    batch_spikes = float(m_for_stats.last_batch_spikes)
-                    batch_neuron_steps = float(m_for_stats.last_batch_neuron_steps)
-                    if batch_neuron_steps > 0.0:
-                        epoch_spikes += batch_spikes
-                        epoch_neuron_steps += batch_neuron_steps
-                        global_spikes += batch_spikes
-                        global_neuron_steps += batch_neuron_steps
-
                 loss, loss_items = compute_loss(pred, targets.to(device))
 
                 # Scale loss by current accumulate factor to keep LR behavior invariant
@@ -576,22 +554,6 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
         scheduler.step()
 
         if RANK in {-1, 0}:
-            # ---- per-epoch firing rate logging ----
-            epoch_firing_rate = 0.0
-            if epoch_neuron_steps > 0.0:
-                epoch_firing_rate = epoch_spikes / epoch_neuron_steps
-                LOGGER.info(f"[Epoch {epoch}] mean firing rate = {epoch_firing_rate:.6f}")
-
-                file_exists = firing_csv_path.exists()
-                global_firing_rate = (
-                    global_spikes / global_neuron_steps if global_neuron_steps > 0.0 else 0.0
-                )
-                with open(firing_csv_path, "a", newline="") as f:
-                    writer = csv.writer(f)
-                    if not file_exists:
-                        writer.writerow(["epoch", "epoch_firing_rate", "global_firing_rate_so_far"])
-                    writer.writerow([epoch, epoch_firing_rate, global_firing_rate])
-
             callbacks.run("on_train_epoch_end", epoch=epoch)
             ema.update_attr(model, include=["yaml", "nc", "hyp", "names", "stride", "class_weights"])
             final_epoch = (epoch + 1 == epochs) or stopper.possible_stop
@@ -651,24 +613,6 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
                     torch.save(ckpt, best)
                 if opt.save_period > 0 and epoch % opt.save_period == 0:
                     torch.save(ckpt, w / f"epoch{epoch}.pt")
-
-                # ---- NEW: save weight snapshot into the epoch folder as well ----
-                # If we had validation this epoch, epoch_save_dir points to runs/.../epoch_{epoch}
-                # If not (e.g., noval and not final_epoch), fall back to save_dir.
-                if "epoch_save_dir" in locals():
-                    epoch_weights_path = epoch_save_dir / f"weights_epoch_{epoch}.pt"
-                else:
-                    epoch_weights_path = save_dir / f"weights_epoch_{epoch}.pt"
-
-                # lighter checkpoint for per-epoch snapshot
-                epoch_ckpt = {
-                    "epoch": epoch,
-                    "model": ckpt["model"],
-                    "ema": ckpt["ema"],
-                    "opt": ckpt["opt"],
-                }
-                torch.save(epoch_ckpt, epoch_weights_path)
-
                 del ckpt
                 callbacks.run("on_model_save", last, epoch, final_epoch, best_fitness, fi)
 
@@ -683,14 +627,6 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
 
     # End of training
     if RANK in {-1, 0}:
-        # ---- global firing rate over entire training ----
-        if global_neuron_steps > 0.0:
-            global_firing_rate = global_spikes / global_neuron_steps
-            LOGGER.info(f"Global mean firing rate over all epochs: {global_firing_rate:.6f}")
-            with open(firing_csv_path, "a", newline="") as f:
-                writer = csv.writer(f)
-                writer.writerow(["FINAL_GLOBAL", global_firing_rate, global_firing_rate])
-
         LOGGER.info(f"\n{epoch - start_epoch + 1} epochs completed in {(time.time() - t0) / 3600:.3f} hours.")
         for f in last, best:
             if f.exists():

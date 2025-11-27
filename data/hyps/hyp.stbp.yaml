@@ -34,11 +34,3 @@ mosaic: 1.0             # image mosaic (probability)
 mixup: 0.0              # image mixup (probability)
 copy_paste: 0.0         # segment copy-paste (probability)
 
-# =========================
-# SNN-specific hyperparameters (STBP)
-# =========================
-snn_thresh: 1.0         # surrogate threshold center (Heaviside threshold)
-snn_subthresh: 0.5      # sub-threshold width factor (boxcar window)
-snn_tau: -1.1            # membrane time constant (LIF_tau)
-snn_mem_init: 0.5       # initial membrane potential
-snn_spiking: 1          # 1: spiking mode, 0: rate-like (no hard spikes)

@@ -146,11 +146,6 @@ class STBP_YOLOTiny(nn.Module):
         self.hw = None          # (H, W) cache to detect resolution changes
         self._state_B = None    # batch size used for current states
 
-        # ---- spike statistics for firing rate ----
-        # These are per-forward (per-batch) stats, used by the trainer.
-        self.last_batch_spikes = 0.0
-        self.last_batch_neuron_steps = 0.0
-
     # ---------------- helpers: states ----------------
     @torch.no_grad()
     def _lazy_init_states(self, x: torch.Tensor):
@@ -234,22 +229,6 @@ class STBP_YOLOTiny(nn.Module):
         self._state_B = None
         if self.log_reset:
             tqdm.tqdm.write("[SNN] states reset")
-
-    # ---------------- helpers: firing-rate stats ----------------
-    def _accumulate_spike_stats(self, module: nn.Module, B: int):
-        """
-        Accumulate spike statistics for firing-rate computation.
-
-        Assumes spiking blocks store their last spikes in module.last_spk
-        with shape [B, ...].
-        """
-        if not hasattr(module, "last_spk") or module.last_spk is None:
-            return
-        with torch.no_grad():
-            spk = module.last_spk
-            self.last_batch_spikes += float(spk.float().sum().item())
-            # (#neurons per sample) * batch_size * 1 timestep
-            self.last_batch_neuron_steps += float(spk[0].numel() * B)
 
     # ---------------- helpers: freezing ----------------
     def freeze_backbone(self):
@@ -351,61 +330,40 @@ class STBP_YOLOTiny(nn.Module):
         P4 = torch.zeros(B, 256, H // 16, W // 16, device=dev, dtype=torch.float32)
         P5 = torch.zeros(B, 512, H // 32, W // 32, device=dev, dtype=torch.float32)
 
-        # Reset batch spike statistics
-        self.last_batch_spikes = 0.0
-        self.last_batch_neuron_steps = 0.0
-
         # ---------------- Temporal loop ----------------
         for t in range(self.num_steps):
             # Backbone
             y0 = self.m0(x)  # non-spiking stem
-
             y1 = self.m1.forward_step(y0)
-            self._accumulate_spike_stats(self.m1, B)
             self._log_spike("m1", self.m1, t)
 
             y2 = self.m2.forward_step(y1)
-            self._accumulate_spike_stats(self.m2, B)
             self._log_spike("m2", self.m2, t)
 
             y3 = self.m3.forward_step(y2)
-            self._accumulate_spike_stats(self.m3, B)
             self._log_spike("m3", self.m3, t)
 
             y4 = self.m4.forward_step(y3)
-            self._accumulate_spike_stats(self.m4, B)
-
             y5 = self.m5.forward_step(y4)  # P4 / 16
-            self._accumulate_spike_stats(self.m5, B)
             self._log_spike("m5", self.m5, t)
 
             y6 = self.m6.forward_step(y5)
-            self._accumulate_spike_stats(self.m6, B)
-
             y7 = self.m7.forward_step(y6)
-            self._accumulate_spike_stats(self.m7, B)
             self._log_spike("m7", self.m7, t)
 
-            y8 = self.m8.forward_step(y7)
-            self._accumulate_spike_stats(self.m8, B)
+            y8 = self.m8.forward_step(y7)  # / 32
 
             # Head
             y9 = self.m9.forward_step(y8)
-            self._accumulate_spike_stats(self.m9, B)
-
             y10 = self.m10.forward_step(y9)  # P5 / 32
-            self._accumulate_spike_stats(self.m10, B)
             self._log_spike("m10", self.m10, t)
 
             y11 = self.m11.forward_step(y9)  # from layer 9
-            self._accumulate_spike_stats(self.m11, B)
             self._log_spike("m11", self.m11, t)
 
             y12 = self.up(y11)
             y13 = self.cat([y12, y6])          # concat with backbone layer-6
-
             y14 = self.m14.forward_step(y13)   # P4 / 16
-            self._accumulate_spike_stats(self.m14, B)
             self._log_spike("m14", self.m14, t)
 
             # Accumulate (cast to float32 to match accumulators under AMP)

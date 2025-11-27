@@ -1,16 +1,40 @@
+1.pretrain(snn)
 python train.py \
   --cfg stbp_py \
-  --weights ' ' \
-  --data data/coco.yaml \
+  --weights '' \
+  --data data/coco2017.yaml \
   --hyp data/hyps/hyp.stbp.yaml \
-  --epochs 20 \
+  --epochs 300 \
+  --batch-size 8 \
+  --accumulate 4 \
+  --num-steps 5 \
+  --snn-thresh 1.0 \
+  --snn-subthresh 0.5 \
+  --snn-tau 0 \
+  --snn-mem-init 0.5 \
+  --snn-spiking 1 \
+  --imgsz 416 \
+  --num-steps 5 \
+  --device 0 \
+  --project runs/pretrain/coco \
+  --name stbp_T5_tau1 \
+  --snn-freeze none
+
+2.fine-tune(snn)
+python train.py \
+  --cfg stbp_py \
+  --weights ./runs/stbp/stbp_pretrain_T4_tau-1.1/weights/best.pt \
+  --data data/rf100_road-traffic.yaml \
+  --hyp data/hyps/hyp.stbp.yaml \
+  --epochs 50 \
   --batch-size 8 \
   --imgsz 416 \
-  --num-steps 4 \
-  --snn-freeze none \
+  --num-steps 5 \
+  --snn-thresh 1.0 \
+  --snn-subthresh 0.5 \
   --snn-tau -1.1 \
-  --accumulate 4 \
-  --project runs/stbp \
-  --name stbp_pretrain_T4_tau-1.1 \
-  --device 0 \
-  --workers 0
+  --snn-mem-init 0.5 \
+  --snn-spiking 1 \
+  --snn-freeze backbone \
+  --project runs/finetune/rf100 \
+  --name solo_T5_tau-1.1_freezeback

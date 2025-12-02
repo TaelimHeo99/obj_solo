@@ -20,6 +20,27 @@ python train.py \
   --name stbp_T5_tau1 \
   --snn-freeze none
 
+  python train.py \
+  --cfg stbp_py \
+  --weights '' \
+  --data data/coco.yaml \
+  --hyp data/hyps/hyp.stbp.yaml \
+  --epochs 100 \
+  --batch-size 8 \
+  --accumulate 4 \
+  --num-steps 5 \
+  --snn-thresh 1.0 \
+  --snn-subthresh 0.5 \
+  --snn-tau 0 \
+  --snn-mem-init 0.5 \
+  --snn-spiking 1 \
+  --imgsz 416 \
+  --device 0 \
+  --project runs/pretrain/coco \
+  --name stbp_T5_tau0_init \
+  --snn-freeze none \
+  --init-detect-bias 1
+
 python train.py \
   --cfg stbp_py \
   --weights '' \

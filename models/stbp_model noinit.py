@@ -5,8 +5,8 @@
 # - Two detection scales: P4 (1/16), P5 (1/32)
 # - Ultralytics compatibility: self.model[-1] is Detect
 # - Batch-wise state reset with safe handling of batch/shape changes
-# - IMPORTANT: YOLOv5-style Detect bias initialization can be toggled
-#   via init_detect_bias flag (no need to modify models/yolo.py)
+# - IMPORTANT: Adds YOLOv5-style Detect bias initialization here
+#   (no need to modify models/yolo.py)
 # ------------------------------------------------------------
 
 from typing import List, Optional, Sequence
@@ -70,7 +70,6 @@ class STBP_YOLOTiny(nn.Module):
         layers_to_log: Optional[Sequence[str]] = None,  # e.g., ["m1","m5","m10","m14"]
         reset_on_batch: bool = True,  # reset SNN states at the start of every batch
         log_reset: bool = False,      # log when states are reset (for verification)
-        init_detect_bias: bool = True,  # NEW: toggle YOLOv5-style Detect bias init
     ):
         super().__init__()
 
@@ -95,9 +94,6 @@ class STBP_YOLOTiny(nn.Module):
 
         # ---- state reset policy ----
         self.reset_on_batch = bool(reset_on_batch)
-
-        # ---- detect bias init policy ----
-        self.init_detect_bias = bool(init_detect_bias)
 
         # ---------------- Backbone (0..8) ----------------
         self.m0 = Conv_2(3, 32, k=3, s=2)              # 0
@@ -126,22 +122,21 @@ class STBP_YOLOTiny(nn.Module):
         self.stride = self.detect.stride
         check_anchor_order(self.detect)
 
-        # Normalize anchors and (optionally) initialize biases (YOLOv5-style)
+        # Normalize anchors and initialize biases (YOLOv5-style)
         with torch.no_grad():
             # Normalize anchors by stride (standard YOLO practice)
             self.detect.anchors /= self.detect.stride.view(-1, 1, 1)
 
-            if self.init_detect_bias:
-                # ---- YOLOv5-style Detect bias initialization ----
-                # Accelerates early training by providing useful priors for obj and cls.
-                # (Assume ~8 objects per 640x640 image; uniform class prior if cf is unknown.)
-                for mi, s in zip(self.detect.m, self.detect.stride):
-                    b = mi.bias.view(self.detect.na, -1)  # (na, 5+nc)
-                    # objectness bias: ~8 objects per image
-                    b[:, 4] += math.log(8 / (640.0 / float(s)) ** 2)
-                    # class bias: uniform prior over nc classes
-                    b[:, 5 : 5 + self.nc] += math.log(0.6 / (self.nc - 0.99999))
-                    mi.bias = torch.nn.Parameter(b.view(-1), requires_grad=True)
+            # ---- YOLOv5-style Detect bias initialization ----
+            # Accelerates early training by providing useful priors for obj and cls.
+            # (Assume ~8 objects per 640x640 image; uniform class prior if cf is unknown.)
+            for mi, s in zip(self.detect.m, self.detect.stride):
+                b = mi.bias.view(self.detect.na, -1)  # (na, 5+nc)
+                # objectness bias
+                b[:, 4] += math.log(8 / (640.0 / float(s)) ** 2)
+                # class bias
+                b[:, 5 : 5 + self.nc] += math.log(0.6 / (self.nc - 0.99999))
+                mi.bias = torch.nn.Parameter(b.view(-1), requires_grad=True)
 
         # For Ultralytics trainer compatibility (expects model[-1] is Detect)
         self.model = nn.ModuleList([self.detect])

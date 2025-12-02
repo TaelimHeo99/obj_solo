@@ -229,9 +229,6 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
         spiking=(None if opt.snn_spiking is None else bool(opt.snn_spiking)),
     )
 
-    # For backwards compatibility with old checkpoints (may not have this attribute)
-    init_detect_bias_flag = bool(getattr(opt, "init_detect_bias", 1))
-
     if pretrained:
         with torch_distributed_zero_first(LOCAL_RANK):
             weights = attempt_download(weights)
@@ -239,20 +236,10 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
         # Choose model implementation (SNN python or YAML-based)
         if opt.cfg == "stbp_py":
             anchors = ((10, 14, 23, 27, 37, 58), (81, 82, 135, 169, 344, 319))
-            model = STBP_YOLOTiny(
-                nc=nc,
-                anchors=anchors,
-                num_steps=opt.num_steps,
-                init_detect_bias=init_detect_bias_flag,
-            ).to(device)
+            model = STBP_YOLOTiny(nc=nc, anchors=anchors, num_steps=opt.num_steps).to(device)
         elif opt.cfg == "solo_py":
             anchors = ((10, 14, 23, 27, 37, 58), (81, 82, 135, 169, 344, 319))
-            model = SOLO_YOLOTiny(
-                nc=nc,
-                anchors=anchors,
-                num_steps=opt.num_steps,
-                init_detect_bias=init_detect_bias_flag,
-            ).to(device)
+            model = SOLO_YOLOTiny(nc=nc, anchors=anchors, num_steps=opt.num_steps).to(device)
         else:
             model = Model(cfg or ckpt["model"].yaml, ch=3, nc=nc, anchors=hyp.get("anchors")).to(device)
 
@@ -264,20 +251,10 @@ def train(hyp, opt, device, callbacks):  # hyp is path/to/hyp.yaml or hyp dictio
     else:
         if opt.cfg == "stbp_py":
             anchors = ((10, 14, 23, 27, 37, 58), (81, 82, 135, 169, 344, 319))
-            model = STBP_YOLOTiny(
-                nc=nc,
-                anchors=anchors,
-                num_steps=opt.num_steps,
-                init_detect_bias=init_detect_bias_flag,
-            ).to(device)
+            model = STBP_YOLOTiny(nc=nc, anchors=anchors, num_steps=opt.num_steps).to(device)
         elif opt.cfg == "solo_py":
             anchors = ((10, 14, 23, 27, 37, 58), (81, 82, 135, 169, 344, 319))
-            model = SOLO_YOLOTiny(
-                nc=nc,
-                anchors=anchors,
-                num_steps=opt.num_steps,
-                init_detect_bias=init_detect_bias_flag,
-            ).to(device)
+            model = SOLO_YOLOTiny(nc=nc, anchors=anchors, num_steps=opt.num_steps).to(device)
         else:
             model = Model(cfg, ch=3, nc=nc, anchors=hyp.get("anchors")).to(device)
 
@@ -809,14 +786,6 @@ def parse_opt(known=False):
         help="SNN-only: 'backbone' to freeze m0..m8, 'detect_only' to train Detect head only",
     )
 
-    # ---- Detect bias init toggle (SNN python models only) ----
-    parser.add_argument(
-        "--init-detect-bias",
-        type=int,
-        default=1,
-        help="SNN-only: 1 to enable YOLOv5-style Detect bias init, 0 to disable",
-    )
-
     # ---- Gradient Accumulation ----
     parser.add_argument(
         "--accumulate",
@@ -849,9 +818,6 @@ def main(opt, callbacks=Callbacks()):
             d = torch_load(last, map_location="cpu")["opt"]
         opt = argparse.Namespace(**d)
         opt.cfg, opt.weights, opt.resume = "", str(last), True
-        # Backward compatibility: older opt.yaml may not have init_detect_bias
-        if not hasattr(opt, "init_detect_bias"):
-            opt.init_detect_bias = 1
         if is_url(opt_data):
             opt.data = check_file(opt_data)
     else:
